@@ -1,4 +1,4 @@
-openai>=1.0.0
-numpy
-pandas
 streamlit
+pandas
+numpy
+openai>=1.0.0
