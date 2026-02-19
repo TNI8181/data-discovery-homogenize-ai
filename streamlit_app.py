@@ -115,7 +115,6 @@ def _pick_canonical_for_group(group_variants, api_key: str, llm_model: str):
     Returns: {"canonical": "...", "variants": [...]}
     """
     from openai import OpenAI
-    import json
 
     client = OpenAI(api_key=api_key)
 
@@ -138,8 +137,9 @@ You are helping homogenize legacy data field names for an insurance data discove
 Given a list of column name variants that likely mean the same business concept:
 
 1) Choose the best canonical name for business users.
-2) Return the canonical in Title Case with spaces (NOT snake_case).
+2) Canonical must be Title Case with spaces (NOT snake_case).
 3) Avoid abbreviations if a clearer term exists.
+4) Return variants exactly as provided.
 
 Variants:
 {group_variants}
@@ -150,19 +150,20 @@ Variants:
         input=prompt,
         text={
             "format": {
+                "name": "homogenization_result",   # ✅ REQUIRED
                 "type": "json_schema",
-                "json_schema": {
-                    "name": "homogenization_result",
-                    "schema": schema,
-                }
+                "schema": schema                  # ✅ schema lives here in this variant
             }
-        },
+        }
     )
 
-    # Safe extraction of structured output
-    result_json = response.output_parsed
-
-    return result_json
+    # This should now be parsed JSON (dict) if the SDK supports output_parsed
+    try:
+        return response.output_parsed
+    except Exception:
+        # Fallback: parse raw text
+        import json
+        return json.loads(response.output_text)
 
     prompt = f"""
 You are helping homogenize legacy data field names for an insurance data discovery tool.
