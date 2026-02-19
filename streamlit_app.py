@@ -113,31 +113,56 @@ def _pick_canonical_for_group(group_variants, api_key: str, llm_model: str):
     """
     Uses an LLM to pick the most business-readable canonical name (Option 1).
     Returns: {"canonical": "...", "variants": [...]}
-    Cached by (group_variants, llm_model). api_key included only to satisfy cache signature.
     """
-    try:
-        from openai import OpenAI
-    except Exception as e:
-        raise RuntimeError("Missing dependency: openai. Install with `pip install openai`") from e
+    from openai import OpenAI
+    import json
 
     client = OpenAI(api_key=api_key)
 
     schema = {
-        "name": "homogenization_result",
-        "strict": True,
-        "schema": {
-            "type": "object",
-            "additionalProperties": False,
-            "properties": {
-                "canonical": {"type": "string"},
-                "variants": {
-                    "type": "array",
-                    "items": {"type": "string"}
-                }
-            },
-            "required": ["canonical", "variants"]
-        }
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "canonical": {"type": "string"},
+            "variants": {
+                "type": "array",
+                "items": {"type": "string"}
+            }
+        },
+        "required": ["canonical", "variants"]
     }
+
+    prompt = f"""
+You are helping homogenize legacy data field names for an insurance data discovery tool.
+
+Given a list of column name variants that likely mean the same business concept:
+
+1) Choose the best canonical name for business users.
+2) Return the canonical in Title Case with spaces (NOT snake_case).
+3) Avoid abbreviations if a clearer term exists.
+
+Variants:
+{group_variants}
+"""
+
+    response = client.responses.create(
+        model=llm_model,
+        input=prompt,
+        text={
+            "format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "homogenization_result",
+                    "schema": schema,
+                }
+            }
+        },
+    )
+
+    # Safe extraction of structured output
+    result_json = response.output_parsed
+
+    return result_json
 
     prompt = f"""
 You are helping homogenize legacy data field names for an insurance data discovery tool.
