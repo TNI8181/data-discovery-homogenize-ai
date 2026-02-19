@@ -399,37 +399,89 @@ if analyze:
 
     st.dataframe(field_df, use_container_width=True)
 
-    # -------------------------------
-    # Cross Tab (X / Blank) + Totals Row + Repetition Count
-    #   If homogenization is enabled, show canonical + variants next to the index
-    # -------------------------------
-    if not field_df.empty:
-        st.write("## Report vs Field Cross Tab (X = Present)")
+   # -------------------------------
+# Cross Tab (Canonical in column_original + legacy_columns) + Totals Row + Repetition Count
+# Logic:
+# - AI gives canonical_map (orig -> canonical business label) and variants_map (orig -> "v1, v2, ...")
+# - We collapse all variants into ONE row per canonical field on the cross tab
+# - cross tab index shows ONLY the canonical name (column_original)
+# - legacy_columns shows ONLY the other variants (excluding the canonical itself), comma-separated
+# - X is present in a report if ANY variant for that canonical appears in that report
+# -------------------------------
+if not field_df.empty:
+    st.write("## Report vs Field Cross Tab (X = Present)")
 
+    # If homogenization is enabled and we have AI results, collapse onto canonical
+    if enable_homog:
+        # 1) Map each original column to its canonical business label
+        tmp = field_df.copy()
+        tmp["canonical"] = tmp["column_original"].map(canonical_map).fillna(tmp["column_original"])
+
+        # 2) Build canonical -> set(all variants) using variants_map (comma-separated strings)
+        canonical_to_variants = {}
+        for orig in tmp["column_original"].dropna().astype(str).unique():
+            canon = canonical_map.get(orig, orig)
+            v_str = variants_map.get(orig, orig)
+            parts = [p.strip() for p in str(v_str).split(",") if p.strip()]
+            canonical_to_variants.setdefault(canon, set()).update(parts)
+
+        # 3) canonical -> legacy_columns (exclude canonical itself, case-insensitive)
+        canonical_to_legacy = {}
+        for canon, varset in canonical_to_variants.items():
+            canon_norm = str(canon).strip().lower()
+            legacy_only = sorted([v for v in varset if str(v).strip().lower() != canon_norm])
+            canonical_to_legacy[canon] = ", ".join(legacy_only)
+
+        # 4) Collapse presence: one row per (report_name, canonical)
+        collapsed = (
+            tmp.groupby(["report_name", "canonical"], as_index=False)
+               .size()
+               .drop(columns=["size"])
+        )
+
+        # 5) Crosstab on canonical (this becomes column_original)
+        cross_counts = pd.crosstab(
+            collapsed["canonical"],
+            collapsed["report_name"]
+        )
+
+        cross_tab = cross_counts.applymap(lambda v: "x" if v > 0 else "")
+
+        # 6) Insert legacy_columns next to canonical index
+        cross_tab.insert(
+            loc=0,
+            column="legacy_columns",
+            value=cross_tab.index.to_series().map(canonical_to_legacy).fillna("")
+        )
+
+        # 7) Repetition Count (count of x across report columns only)
+        report_cols = [c for c in cross_tab.columns if c not in ["legacy_columns", "Repetition Count"]]
+        cross_tab["Repetition Count"] = (cross_tab[report_cols] == "x").sum(axis=1)
+
+        # 8) Totals row (count of x per report column; blank legacy; repetition total)
+        totals = (cross_tab[report_cols] == "x").sum(axis=0)
+        totals["legacy_columns"] = ""
+        totals["Repetition Count"] = int(cross_tab["Repetition Count"].sum())
+        cross_tab.loc["Totals"] = totals
+
+        # Rename index label visually to match your requirement
+        cross_tab.index.name = "column_original"
+
+        st.dataframe(cross_tab, use_container_width=True)
+
+    else:
+        # No homogenization: use raw column_original as-is
         cross_counts = pd.crosstab(
             field_df["column_original"],
             field_df["report_name"]
         )
-
         cross_tab = cross_counts.applymap(lambda v: "x" if v > 0 else "")
+
         cross_tab["Repetition Count"] = (cross_tab == "x").sum(axis=1)
 
-        if enable_homog:
-            # Insert right after the index (column_original)
-            canonical_series = cross_tab.index.to_series().map(canonical_map).fillna("")
-            variants_series = cross_tab.index.to_series().map(variants_map).fillna("")
-
-            cross_tab.insert(loc=0, column="Recommended Canonical", value=canonical_series)
-            cross_tab.insert(loc=1, column="Similar Variants", value=variants_series)
-
-        # Totals row (count X marks per report column)
         totals = (cross_tab == "x").sum(axis=0)
-
-        if enable_homog:
-            totals["Recommended Canonical"] = ""
-            totals["Similar Variants"] = ""
-
         totals["Repetition Count"] = int(cross_tab["Repetition Count"].sum())
         cross_tab.loc["Totals"] = totals
 
+        cross_tab.index.name = "column_original"
         st.dataframe(cross_tab, use_container_width=True)
