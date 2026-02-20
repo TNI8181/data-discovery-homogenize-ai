@@ -418,17 +418,30 @@ if analyze:
                 st.error(f"Homogenization failed: {e}")
                 canonical_map, variants_map, group_sizes = {}, {}, {}
 
-    # -------------------------------
-    # Cross Tab (Requested Output)
-    # -------------------------------
-    st.write("## Report vs Field Cross Tab (X = Present)")
+  # ================================
+# Cross Tab (Canonical + Legacy cross-tab per report)
+# WHAT CHANGED:
+# - We STILL keep ONE row per business field (canonical shown as column_original)
+# - BUT we ALSO "cross-tab" legacy usage per report:
+#     For each report you will now see TWO columns:
+#       1) <Report Name>                -> "x" if the canonical itself is present in that report
+#       2) <Report Name> (Legacy Used)  -> comma-separated legacy variants that appeared in that report
+# - This way, legacy columns are NOT ignored — you can see exactly where they occur.
+# ================================
+st.write("## Report vs Field Cross Tab (Canonical + Legacy Usage)")
 
-    if enable_homog and canonical_map and not field_df.empty:
+if not field_df.empty:
+    if enable_homog and canonical_map:
         tmp = field_df.copy()
+
+        # Map each original to its canonical (canonical is one of the originals)
         tmp["canonical"] = tmp["column_original"].map(canonical_map).fillna(tmp["column_original"])
         tmp["group_size"] = tmp["column_original"].map(group_sizes).fillna(1).astype(int)
 
-        # Build canonical -> variants set (only for groups > 1)
+        # Display field (row label): canonical for groups>1, else original itself
+        tmp["display_field"] = np.where(tmp["group_size"] > 1, tmp["canonical"], tmp["column_original"])
+
+        # Build overall legacy list per canonical (for the legacy_columns column on the left)
         canonical_to_variants = {}
         for orig in tmp["column_original"].dropna().astype(str).unique():
             size = group_sizes.get(orig, 1)
@@ -439,56 +452,67 @@ if analyze:
             parts = [p.strip() for p in str(v_str).split(",") if p.strip()]
             canonical_to_variants.setdefault(canon, set()).update(parts)
 
-        # canonical -> legacy_columns (exclude canonical itself)
         canonical_to_legacy = {}
         for canon, varset in canonical_to_variants.items():
             canon_norm = str(canon).strip().lower()
             legacy_only = sorted([v for v in varset if str(v).strip().lower() != canon_norm])
             canonical_to_legacy[canon] = ", ".join(legacy_only)
 
-        # Keep all singletons as-is; for groups>1 keep ONLY canonical rows
-        keep_mask = (tmp["group_size"] <= 1) | (tmp["column_original"].astype(str) == tmp["canonical"].astype(str))
-        tmp_kept = tmp.loc[keep_mask].copy()
+        # For singletons, legacy_columns should be blank
+        # (because there's nothing to homogenize)
+        def overall_legacy_for_display(display_field: str) -> str:
+            return canonical_to_legacy.get(display_field, "")
 
-        # Ensure canonical is what we display for homogenized groups
-        tmp_kept.loc[tmp_kept["group_size"] > 1, "column_original"] = tmp_kept.loc[tmp_kept["group_size"] > 1, "canonical"]
+        # ---- Per report x legacy usage aggregation ----
+        # For each (report_name, display_field) compute:
+        # - canonical_present: did the canonical itself appear in this report?
+        # - legacy_used: which legacy variants appeared in this report?
+        def agg_group(g: pd.DataFrame) -> pd.Series:
+            display = g["display_field"].iloc[0]
+            # If group_size==1, treat as canonical
+            if int(g["group_size"].iloc[0]) <= 1:
+                return pd.Series({"canonical_present": True, "legacy_used": ""})
 
-        # Collapse presence to one per (report_name, column_original)
-        collapsed = tmp_kept.groupby(["report_name", "column_original"], as_index=False).size().drop(columns=["size"])
+            canon = g["canonical"].iloc[0]
+            canon_norm = str(canon).strip().lower()
 
-        cross_counts = pd.crosstab(collapsed["column_original"], collapsed["report_name"])
-        cross_tab = cross_counts.applymap(lambda v: "x" if v > 0 else "")
+            canon_present = any(str(x).strip().lower() == canon_norm for x in g["column_original"].tolist())
 
-        # legacy_columns next to column_original
+            legacy_hits = sorted({
+                str(x).strip()
+                for x in g["column_original"].tolist()
+                if str(x).strip().lower() != canon_norm
+            })
+
+            return pd.Series({
+                "canonical_present": bool(canon_present),
+                "legacy_used": ", ".join(legacy_hits)
+            })
+
+        agg = (
+            tmp.groupby(["report_name", "display_field"], as_index=False)
+               .apply(agg_group)
+               .reset_index(drop=True)
+        )
+
+        # Build a wide table with TWO columns per report
+        reports = sorted(agg["report_name"].unique().tolist())
+        fields = sorted(agg["display_field"].unique().tolist())
+
+        # Start base table indexed by display_field (this is what user sees as column_original)
+        cross_tab = pd.DataFrame(index=fields)
+        cross_tab.index.name = "column_original"
+
+        # Add overall legacy_columns next to column_original
         cross_tab.insert(
             loc=0,
             column="legacy_columns",
-            value=cross_tab.index.to_series().map(canonical_to_legacy).fillna("")
+            value=pd.Series(fields, index=fields).map(overall_legacy_for_display).fillna("")
         )
 
-        # Repetition Count across report columns only
-        report_cols = [c for c in cross_tab.columns if c not in ["legacy_columns", "Repetition Count"]]
-        cross_tab["Repetition Count"] = (cross_tab[report_cols] == "x").sum(axis=1)
+        # Fill report columns
+        for r in reports:
+            sub = agg[agg["report_name"] == r].set_index("display_field")
 
-        # Totals row
-        totals = (cross_tab[report_cols] == "x").sum(axis=0)
-        totals["legacy_columns"] = ""
-        totals["Repetition Count"] = int(cross_tab["Repetition Count"].sum())
-        cross_tab.loc["Totals"] = totals
-
-        cross_tab.index.name = "column_original"
-        st.dataframe(cross_tab, use_container_width=True)
-
-    else:
-        # Non-AI fallback: raw columns
-        cross_counts = pd.crosstab(field_df["column_original"], field_df["report_name"])
-        cross_tab = cross_counts.applymap(lambda v: "x" if v > 0 else "")
-
-        cross_tab["Repetition Count"] = (cross_tab == "x").sum(axis=1)
-
-        totals = (cross_tab == "x").sum(axis=0)
-        totals["Repetition Count"] = int(cross_tab["Repetition Count"].sum())
-        cross_tab.loc["Totals"] = totals
-
-        cross_tab.index.name = "column_original"
-        st.dataframe(cross_tab, use_container_width=True)
+            # Canonical X column
+            cross_tab[r]
