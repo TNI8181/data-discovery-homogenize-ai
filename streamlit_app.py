@@ -5,9 +5,9 @@ import numpy as np
 import json
 import os
 
-# -------------------------------
+# =========================================================
 # Helper: Flexible CSV Reader
-# -------------------------------
+# =========================================================
 def read_csv_flexible(uploaded_file):
     """
     Handles:
@@ -18,22 +18,16 @@ def read_csv_flexible(uploaded_file):
       "val1,val2,val3"
     """
     uploaded_file.seek(0)
-
-    # Try normal read first
     try:
         df = pd.read_csv(uploaded_file, encoding="utf-8-sig")
     except Exception:
         df = None
 
-    # If only 1 column detected, likely wrapped-row CSV
+    # If it parsed into a single column, likely "whole-row quoted" CSV
     if df is None or df.shape[1] == 1:
         uploaded_file.seek(0)
         raw = uploaded_file.read()
-
-        if isinstance(raw, bytes):
-            text = raw.decode("utf-8-sig", errors="replace")
-        else:
-            text = raw
+        text = raw.decode("utf-8-sig", errors="replace") if isinstance(raw, bytes) else raw
 
         fixed_lines = []
         for line in text.splitlines():
@@ -42,15 +36,14 @@ def read_csv_flexible(uploaded_file):
                 line = line[1:-1]
             fixed_lines.append(line)
 
-        fixed_text = "\n".join(fixed_lines)
-        df = pd.read_csv(io.StringIO(fixed_text))
+        df = pd.read_csv(io.StringIO("\n".join(fixed_lines)))
 
     return df
 
 
-# -------------------------------
-# AI Homogenization (Embeddings + Similarity Grouping + Canonical Name via LLM)
-# -------------------------------
+# =========================================================
+# AI Homogenization: Embeddings + Similarity Grouping + Canonical Selection
+# =========================================================
 def _cosine_sim_matrix(vectors: np.ndarray) -> np.ndarray:
     norms = np.linalg.norm(vectors, axis=1, keepdims=True)
     norms = np.where(norms == 0, 1.0, norms)
@@ -59,7 +52,7 @@ def _cosine_sim_matrix(vectors: np.ndarray) -> np.ndarray:
 
 def _union_find_groups(sim_mat: np.ndarray, threshold: float):
     """
-    Simple grouping: if similarity(i,j) >= threshold => same group (connected components).
+    Simple connected-components grouping based on cosine similarity threshold.
     """
     n = sim_mat.shape[0]
     parent = list(range(n))
@@ -90,7 +83,7 @@ def _union_find_groups(sim_mat: np.ndarray, threshold: float):
 def _embed_texts(texts, api_key: str, embedding_model: str):
     """
     Returns embeddings as a numpy array in same order as texts.
-    Cached by (texts, embedding_model). api_key is included only to satisfy Streamlit cache signature.
+    Cached by (texts, embedding_model). api_key included only for cache signature stability.
     """
     try:
         from openai import OpenAI
@@ -99,17 +92,15 @@ def _embed_texts(texts, api_key: str, embedding_model: str):
 
     client = OpenAI(api_key=api_key)
     resp = client.embeddings.create(model=embedding_model, input=texts)
-    vectors = np.array([d.embedding for d in resp.data], dtype=float)
-    return vectors
+    return np.array([d.embedding for d in resp.data], dtype=float)
 
 @st.cache_data(show_spinner=False)
 def _pick_canonical_for_group(group_variants, api_key: str, llm_model: str):
     """
-    Uses an LLM to pick the most business-readable canonical name (Option 1).
-    Returns: {"canonical": "...", "variants": [...]}
+    LLM returns a business-readable canonical label suggestion for the group.
+    IMPORTANT: we'll later force canonical to be one of the existing variants (no invented labels).
     """
     from openai import OpenAI
-
     client = OpenAI(api_key=api_key)
 
     schema = {
@@ -127,10 +118,10 @@ You are helping homogenize legacy data field names for an insurance data discove
 
 Given a list of column name variants that likely mean the same business concept:
 
-1) Choose the best canonical name for business users.
-2) Canonical must be Title Case with spaces (NOT snake_case).
+1) Suggest the best canonical name for business users.
+2) Canonical should be Title Case with spaces (NOT snake_case).
 3) Avoid abbreviations if a clearer term exists.
-4) Return variants exactly as provided.
+4) Return the variants exactly as provided.
 
 Variants:
 {group_variants}
@@ -151,7 +142,7 @@ Variants:
     # Prefer structured parse; fallback to JSON text
     try:
         parsed = response.output_parsed
-        if isinstance(parsed, dict) and "canonical" in parsed and "variants" in parsed:
+        if isinstance(parsed, dict):
             return parsed
     except Exception:
         pass
@@ -159,55 +150,102 @@ Variants:
     try:
         return json.loads(response.output_text)
     except Exception:
-        # Last resort
         return {"canonical": group_variants[0], "variants": group_variants}
+
+def _pick_best_existing_variant(variants):
+    """
+    Choose the most business-readable variant FROM the existing variants.
+    Heuristic (no synonym dictionaries).
+    """
+    def score(v: str) -> tuple:
+        s = str(v).strip()
+        has_space = " " in s
+        has_underscore = "_" in s
+        has_dash = "-" in s
+        is_all_lower = s.islower()
+        is_all_upper = s.isupper()
+
+        words = [w for w in s.replace("_", " ").replace("-", " ").split() if w]
+        titleish = sum(1 for w in words if w[:1].isupper()) >= max(1, int(0.7 * len(words)))
+        short_token_penalty = sum(1 for w in words if len(w) <= 3)
+
+        return (
+            1 if has_space else 0,
+            1 if titleish else 0,
+            0 if not has_underscore else -1,
+            0 if not has_dash else -1,
+            1 if not is_all_lower else 0,
+            1 if not is_all_upper else 0,
+            -short_token_penalty,
+            len(s)
+        )
+
+    return sorted(list(variants), key=score, reverse=True)[0] if variants else ""
+
+def _match_llm_canonical_to_existing(llm_canonical: str, variants):
+    """
+    Force canonical to be one of the existing variants.
+    - If LLM canonical matches an existing variant (case-insensitive), return that exact variant.
+    - Else return best existing variant by heuristic.
+    """
+    if not variants:
+        return str(llm_canonical).strip()
+
+    canon_norm = str(llm_canonical).strip().lower()
+    for v in variants:
+        if str(v).strip().lower() == canon_norm:
+            return v
+
+    return _pick_best_existing_variant(variants)
 
 def run_homogenization(unique_cols, api_key: str, embedding_model: str, llm_model: str, threshold: float):
     """
     Returns:
-      canonical_map[col] -> canonical_name
-      variants_map[col]  -> comma-separated variants in its group
+      canonical_map[col] -> canonical (must be one of the original variants)
+      variants_map[col]  -> comma-separated variants in its group (original text)
+      group_sizes[col]   -> size of group (used to avoid altering singletons)
     """
     texts = list(unique_cols)
     if not texts:
-        return {}, {}
+        return {}, {}, {}
 
     vectors = _embed_texts(texts, api_key=api_key, embedding_model=embedding_model)
     sim = _cosine_sim_matrix(vectors)
-
     groups_idx = _union_find_groups(sim, threshold=threshold)
 
     canonical_map = {}
     variants_map = {}
+    group_sizes = {}
 
     for idxs in groups_idx:
         group = [texts[i] for i in idxs]
-        result = _pick_canonical_for_group(group_variants=group, api_key=api_key, llm_model=llm_model)
 
-        canonical = str(result.get("canonical", "")).strip() or group[0]
-        variants = result.get("variants", group)
-        if not isinstance(variants, list) or len(variants) == 0:
+        if len(group) == 1:
+            canonical = group[0]
             variants = group
+        else:
+            result = _pick_canonical_for_group(group_variants=group, api_key=api_key, llm_model=llm_model)
+            llm_canon = str(result.get("canonical", "")).strip()
+            canonical = _match_llm_canonical_to_existing(llm_canon, group)
+            variants = group  # preserve originals exactly as they appear
 
         variants_str = ", ".join([str(v) for v in variants])
 
         for v in group:
             canonical_map[v] = canonical
             variants_map[v] = variants_str
+            group_sizes[v] = len(group)
 
-    return canonical_map, variants_map
+    return canonical_map, variants_map, group_sizes
 
 
-# -------------------------------
-# Page Config
-# -------------------------------
+# =========================================================
+# Streamlit UI
+# =========================================================
 st.set_page_config(page_title="Insurance Data Discovery", layout="wide")
 st.title("Insurance Data Discovery Tool (Module 1)")
-st.caption("Upload sample reports (Excel/CSV). We will extract column metadata and build a field inventory.")
+st.caption("Upload sample reports (Excel/CSV). We will extract column metadata, build a field inventory, and produce a cross-tab. Optional AI homogenization groups similar fields.")
 
-# -------------------------------
-# Inputs
-# -------------------------------
 source_system = st.text_input("Source System Name (e.g., Legacy PAS, Mainframe Claims)")
 
 uploaded_files = st.file_uploader(
@@ -220,11 +258,11 @@ st.markdown("---")
 st.subheader("Homogenization (AI)")
 
 enable_homog = st.checkbox(
-    "Enable AI Homogenization (group similar columns + recommend business-friendly canonical name)",
+    "Enable AI Homogenization (group similar columns; keep only one variant in column_original and move other variants to legacy_columns)",
     value=True
 )
 
-# Prefer secrets/env over UI, but allow UI
+# Prefer secrets/env; allow UI override
 api_key = (st.secrets.get("OPENAI_API_KEY", "") if hasattr(st, "secrets") else "") or os.getenv("OPENAI_API_KEY", "")
 api_key_ui = st.text_input("OpenAI API Key (optional if set in Secrets/env)", type="password")
 api_key = (api_key_ui.strip() or api_key.strip())
@@ -245,11 +283,11 @@ with c3:
 
 analyze = st.button("Analyze Reports", type="primary")
 
-# -------------------------------
-# Main Processing
-# -------------------------------
-if analyze:
 
+# =========================================================
+# Main Processing
+# =========================================================
+if analyze:
     if not uploaded_files:
         st.warning("Please upload at least one Excel or CSV report.")
         st.stop()
@@ -302,11 +340,10 @@ if analyze:
         except Exception as e:
             st.error(f"Could not read {f.name}: {e}")
 
-    profile_df = pd.DataFrame(profile_rows)
-    st.dataframe(profile_df, use_container_width=True)
+    st.dataframe(pd.DataFrame(profile_rows), use_container_width=True)
 
     # -------------------------------
-    # Build Field-Level Inventory (Raw)
+    # Field Inventory (Raw)
     # -------------------------------
     st.write("## Field Inventory (Raw)")
     field_rows = []
@@ -329,19 +366,18 @@ if analyze:
             st.error(f"Could not process {f.name}: {e}")
 
     field_df = pd.DataFrame(field_rows)
+    st.dataframe(field_df, use_container_width=True)
 
     # -------------------------------
-    # AI Homogenization (optional): build maps
+    # AI Homogenization: Build maps
     # -------------------------------
-    canonical_map, variants_map = {}, {}
+    canonical_map, variants_map, group_sizes = {}, {}, {}
     if enable_homog and not field_df.empty:
-        st.write("## Homogenization (AI) Results (Collapsed to Canonical)")
-
         unique_cols = sorted(field_df["column_original"].dropna().astype(str).unique().tolist())
 
         with st.spinner("Running AI homogenization (embeddings + grouping + canonical naming)..."):
             try:
-                canonical_map, variants_map = run_homogenization(
+                canonical_map, variants_map, group_sizes = run_homogenization(
                     unique_cols=unique_cols,
                     api_key=api_key,
                     embedding_model=embedding_model.strip(),
@@ -350,77 +386,88 @@ if analyze:
                 )
             except Exception as e:
                 st.error(f"Homogenization failed: {e}")
-                canonical_map, variants_map = {}, {}
+                canonical_map, variants_map, group_sizes = {}, {}, {}
 
     # -------------------------------
-    # Cross Tab (Canonical in column_original + legacy_columns) + Totals Row + Repetition Count
-    # REQUIRED OUTPUT:
-    # - Index = canonical name (shown as column_original)
-    # - legacy_columns = all other variants (excluding canonical)
-    # - X present per report if any variant exists in that report
+    # Cross Tab (Requested Output)
+    #
+    # REQUIREMENT:
+    # - column_original shows all original distinct fields EXCEPT:
+    #     * variants that were homogenized away
+    # - For a homogenized group (>1):
+    #     * keep ONLY the chosen canonical (which is one of the originals)
+    #     * put the OTHER variants in legacy_columns (comma-separated)
+    # - Presence: if any variant appears in a report, canonical is "x" for that report
+    # - Add Repetition Count + Totals row
     # -------------------------------
-    if not field_df.empty:
-        st.write("## Report vs Field Cross Tab (X = Present)")
+    st.write("## Report vs Field Cross Tab (X = Present)")
 
-        if enable_homog and canonical_map:
-            tmp = field_df.copy()
-            tmp["canonical"] = tmp["column_original"].map(canonical_map).fillna(tmp["column_original"])
+    if enable_homog and canonical_map and not field_df.empty:
+        tmp = field_df.copy()
+        tmp["canonical"] = tmp["column_original"].map(canonical_map).fillna(tmp["column_original"])
+        tmp["group_size"] = tmp["column_original"].map(group_sizes).fillna(1).astype(int)
 
-            # canonical -> variants set
-            canonical_to_variants = {}
-            for orig in tmp["column_original"].dropna().astype(str).unique():
-                canon = canonical_map.get(orig, orig)
-                v_str = variants_map.get(orig, orig)
-                parts = [p.strip() for p in str(v_str).split(",") if p.strip()]
-                canonical_to_variants.setdefault(canon, set()).update(parts)
+        # canonical -> variants set (only for groups > 1)
+        canonical_to_variants = {}
+        for orig in tmp["column_original"].dropna().astype(str).unique():
+            size = group_sizes.get(orig, 1)
+            if size <= 1:
+                continue
+            canon = canonical_map.get(orig, orig)
+            v_str = variants_map.get(orig, orig)
+            parts = [p.strip() for p in str(v_str).split(",") if p.strip()]
+            canonical_to_variants.setdefault(canon, set()).update(parts)
 
-            # canonical -> legacy (exclude canonical itself)
-            canonical_to_legacy = {}
-            for canon, varset in canonical_to_variants.items():
-                canon_norm = str(canon).strip().lower()
-                legacy_only = sorted([v for v in varset if str(v).strip().lower() != canon_norm])
-                canonical_to_legacy[canon] = ", ".join(legacy_only)
+        # canonical -> legacy_columns (exclude canonical itself)
+        canonical_to_legacy = {}
+        for canon, varset in canonical_to_variants.items():
+            canon_norm = str(canon).strip().lower()
+            legacy_only = sorted([v for v in varset if str(v).strip().lower() != canon_norm])
+            canonical_to_legacy[canon] = ", ".join(legacy_only)
 
-            # collapse presence
-            collapsed = (
-                tmp.groupby(["report_name", "canonical"], as_index=False)
-                   .size()
-                   .drop(columns=["size"])
-            )
+        # Keep all singletons as-is; for groups>1 keep ONLY the canonical row(s)
+        keep_mask = (tmp["group_size"] <= 1) | (tmp["column_original"].astype(str) == tmp["canonical"].astype(str))
+        tmp_kept = tmp.loc[keep_mask].copy()
 
-            cross_counts = pd.crosstab(collapsed["canonical"], collapsed["report_name"])
-            cross_tab = cross_counts.applymap(lambda v: "x" if v > 0 else "")
+        # Ensure kept rows show the canonical text (existing variant) in column_original
+        tmp_kept.loc[tmp_kept["group_size"] > 1, "column_original"] = tmp_kept.loc[tmp_kept["group_size"] > 1, "canonical"]
 
-            # Put legacy next to canonical
-            cross_tab.insert(
-                loc=0,
-                column="legacy_columns",
-                value=cross_tab.index.to_series().map(canonical_to_legacy).fillna("")
-            )
+        # Collapse presence to one per (report_name, column_original)
+        collapsed = tmp_kept.groupby(["report_name", "column_original"], as_index=False).size().drop(columns=["size"])
 
-            # repetition across report columns only
-            report_cols = [c for c in cross_tab.columns if c not in ["legacy_columns", "Repetition Count"]]
-            cross_tab["Repetition Count"] = (cross_tab[report_cols] == "x").sum(axis=1)
+        cross_counts = pd.crosstab(collapsed["column_original"], collapsed["report_name"])
+        cross_tab = cross_counts.applymap(lambda v: "x" if v > 0 else "")
 
-            # totals row
-            totals = (cross_tab[report_cols] == "x").sum(axis=0)
-            totals["legacy_columns"] = ""
-            totals["Repetition Count"] = int(cross_tab["Repetition Count"].sum())
-            cross_tab.loc["Totals"] = totals
+        # legacy_columns next to column_original
+        cross_tab.insert(
+            loc=0,
+            column="legacy_columns",
+            value=cross_tab.index.to_series().map(canonical_to_legacy).fillna("")
+        )
 
-            cross_tab.index.name = "column_original"
-            st.dataframe(cross_tab, use_container_width=True)
+        # repetition across report columns only
+        report_cols = [c for c in cross_tab.columns if c not in ["legacy_columns", "Repetition Count"]]
+        cross_tab["Repetition Count"] = (cross_tab[report_cols] == "x").sum(axis=1)
 
-        else:
-            # Non-AI fallback: raw columns
-            cross_counts = pd.crosstab(field_df["column_original"], field_df["report_name"])
-            cross_tab = cross_counts.applymap(lambda v: "x" if v > 0 else "")
+        # totals
+        totals = (cross_tab[report_cols] == "x").sum(axis=0)
+        totals["legacy_columns"] = ""
+        totals["Repetition Count"] = int(cross_tab["Repetition Count"].sum())
+        cross_tab.loc["Totals"] = totals
 
-            cross_tab["Repetition Count"] = (cross_tab == "x").sum(axis=1)
+        cross_tab.index.name = "column_original"
+        st.dataframe(cross_tab, use_container_width=True)
 
-            totals = (cross_tab == "x").sum(axis=0)
-            totals["Repetition Count"] = int(cross_tab["Repetition Count"].sum())
-            cross_tab.loc["Totals"] = totals
+    else:
+        # Non-AI fallback: raw columns
+        cross_counts = pd.crosstab(field_df["column_original"], field_df["report_name"])
+        cross_tab = cross_counts.applymap(lambda v: "x" if v > 0 else "")
 
-            cross_tab.index.name = "column_original"
-            st.dataframe(cross_tab, use_container_width=True)
+        cross_tab["Repetition Count"] = (cross_tab == "x").sum(axis=1)
+
+        totals = (cross_tab == "x").sum(axis=0)
+        totals["Repetition Count"] = int(cross_tab["Repetition Count"].sum())
+        cross_tab.loc["Totals"] = totals
+
+        cross_tab.index.name = "column_original"
+        st.dataframe(cross_tab, use_container_width=True)
