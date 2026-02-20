@@ -43,18 +43,18 @@ def read_csv_flexible(uploaded_file):
 
 
 # =========================================================
-# Homogenization (Safer / Less Overboard)
-# 1) Hard grouping by "collapsed_key" (Policy Number == policy_number == policynumber)
-# 2) Optional AI only to choose canonical WITHIN that group
-# 3) Never groups unrelated fields
+# Homogenization (NO normalization/case changes)
+# - We NEVER modify a column name string.
+# - We ONLY group variants by collapsed_key and pick a canonical FROM THE EXISTING VARIANTS.
 # =========================================================
 def _collapsed_key(s: str) -> str:
+    # Grouping key only; never displayed.
     return re.sub(r"[^a-z0-9]+", "", str(s).strip().lower())
 
-def _pick_best_existing_variant(variants):
+def _pick_best_existing_variant(variants_in_order: list[str]) -> str:
     """
-    Choose most business-readable label among existing variants.
-    Preference: spaces + Title Case-ish, avoid underscores/dashes.
+    Choose the most business-readable variant FROM the existing variants.
+    Returns the exact original string (no casing changes).
     """
     def score(v: str) -> tuple:
         s = str(v).strip()
@@ -68,6 +68,7 @@ def _pick_best_existing_variant(variants):
         titleish = sum(1 for w in words if w[:1].isupper()) >= max(1, int(0.7 * len(words)))
         short_token_penalty = sum(1 for w in words if len(w) <= 3)
 
+        # Higher is better
         return (
             1 if has_space else 0,
             1 if titleish else 0,
@@ -76,15 +77,21 @@ def _pick_best_existing_variant(variants):
             1 if not is_all_lower else 0,
             1 if not is_all_upper else 0,
             -short_token_penalty,
-            len(s)
+            len(s),
         )
 
-    return sorted(list(variants), key=score, reverse=True)[0] if variants else ""
+    if not variants_in_order:
+        return ""
+
+    # Stable tie-breaker: keep earlier-seen if scores equal
+    scored = [(score(v), i, v) for i, v in enumerate(variants_in_order)]
+    scored.sort(key=lambda t: (t[0], -t[1]))  # prefer higher score; earlier index wins via -i
+    return scored[-1][2]
 
 @st.cache_data(show_spinner=False)
-def _pick_canonical_for_group_llm(group_variants, api_key: str, llm_model: str):
+def _pick_canonical_for_group_llm(group_variants_in_order: list[str], api_key: str, llm_model: str) -> dict:
     """
-    LLM suggests canonical; we still FORCE canonical to be one of the group_variants.
+    LLM suggests canonical; we still FORCE canonical to be one of the group variants.
     """
     from openai import OpenAI
     client = OpenAI(api_key=api_key)
@@ -94,9 +101,9 @@ def _pick_canonical_for_group_llm(group_variants, api_key: str, llm_model: str):
         "additionalProperties": False,
         "properties": {
             "canonical": {"type": "string"},
-            "variants": {"type": "array", "items": {"type": "string"}}
+            "variants": {"type": "array", "items": {"type": "string"}},
         },
-        "required": ["canonical", "variants"]
+        "required": ["canonical", "variants"],
     }
 
     prompt = f"""
@@ -105,12 +112,12 @@ You are helping homogenize legacy data field names for an insurance data discove
 Given a list of column name variants that likely mean the same business concept:
 
 1) Suggest the best canonical name for business users.
-2) Canonical should be Title Case with spaces (NOT snake_case).
-3) Avoid abbreviations if a clearer term exists.
+2) Canonical should be readable (e.g., "Policy Number" instead of "policynumber").
+3) IMPORTANT: The canonical MUST be one of the provided variants (do not invent a new label).
 4) Return the variants exactly as provided.
 
 Variants:
-{group_variants}
+{group_variants_in_order}
 """
 
     resp = client.responses.create(
@@ -126,67 +133,74 @@ Variants:
     except Exception:
         pass
 
+    # Fallback
     try:
         return json.loads(resp.output_text)
     except Exception:
-        return {"canonical": group_variants[0], "variants": group_variants}
+        return {"canonical": group_variants_in_order[0], "variants": group_variants_in_order}
 
-def _match_llm_canonical_to_existing(llm_canonical: str, variants):
-    if not variants:
+def _match_llm_canonical_to_existing(llm_canonical: str, variants_in_order: list[str]) -> str:
+    """
+    Force canonical to be EXACTLY one of the existing variants (preserve original case).
+    """
+    if not variants_in_order:
         return str(llm_canonical).strip()
 
     canon_norm = str(llm_canonical).strip().lower()
-    for v in variants:
+    for v in variants_in_order:
         if str(v).strip().lower() == canon_norm:
             return v
-    return _pick_best_existing_variant(variants)
 
-def run_homogenization_conservative(unique_cols, api_key: str, llm_model: str, use_llm: bool):
+    return _pick_best_existing_variant(variants_in_order)
+
+def run_homogenization_conservative(all_unique_cols_in_order: list[str], api_key: str, llm_model: str, use_llm: bool):
     """
     Conservative grouping ONLY by collapsed_key equality.
-    Returns:
-      canonical_map[col] -> canonical (one of original variants)
-      group_sizes[col]   -> size of group
-      legacy_list_by_canon[canonical] -> "a, b, c" (excluding canonical itself)
-      group_variants_by_canon[canonical] -> set(all variants, including canonical)
-    """
-    texts = [str(x) for x in unique_cols if str(x).strip() != ""]
-    if not texts:
-        return {}, {}, {}, {}
 
-    key_to_group = {}
-    for t in texts:
-        key_to_group.setdefault(_collapsed_key(t), []).append(t)
+    Returns:
+      canonical_map[col] -> canonical (exact existing variant string)
+      group_sizes[col]   -> group size
+      legacy_list_by_canon[canonical] -> comma-separated legacy variants (exact strings)
+    """
+    # Build groups in encounter order
+    key_to_variants = {}
+    key_order = []
+    for col in all_unique_cols_in_order:
+        c = str(col)
+        if not c.strip():
+            continue
+        k = _collapsed_key(c)
+        if k not in key_to_variants:
+            key_to_variants[k] = []
+            key_order.append(k)
+        if c not in key_to_variants[k]:
+            key_to_variants[k].append(c)  # preserve original string + order
 
     canonical_map = {}
     group_sizes = {}
     legacy_list_by_canon = {}
-    group_variants_by_canon = {}
 
-    for _, group in key_to_group.items():
-        group = [str(x) for x in group]
-        uniq_group = sorted(set(group), key=lambda x: (x.lower(), x))
-
-        if len(uniq_group) == 1:
-            canon = uniq_group[0]
+    for k in key_order:
+        variants = key_to_variants[k]
+        if len(variants) == 1:
+            canon = variants[0]
         else:
             if use_llm:
-                result = _pick_canonical_for_group_llm(group_variants=uniq_group, api_key=api_key, llm_model=llm_model)
+                result = _pick_canonical_for_group_llm(variants, api_key=api_key, llm_model=llm_model)
                 llm_canon = str(result.get("canonical", "")).strip()
-                canon = _match_llm_canonical_to_existing(llm_canon, uniq_group)
+                canon = _match_llm_canonical_to_existing(llm_canon, variants)
             else:
-                canon = _pick_best_existing_variant(uniq_group)
+                canon = _pick_best_existing_variant(variants)
 
         canon_norm = canon.strip().lower()
-        legacy_only = sorted([v for v in uniq_group if v.strip().lower() != canon_norm])
-        legacy_list_by_canon[canon] = ", ".join(legacy_only)
-        group_variants_by_canon[canon] = set(uniq_group)
+        legacy = [v for v in variants if v.strip().lower() != canon_norm]
+        legacy_list_by_canon[canon] = ", ".join(legacy)
 
-        for v in uniq_group:
+        for v in variants:
             canonical_map[v] = canon
-            group_sizes[v] = len(uniq_group)
+            group_sizes[v] = len(variants)
 
-    return canonical_map, group_sizes, legacy_list_by_canon, group_variants_by_canon
+    return canonical_map, group_sizes, legacy_list_by_canon
 
 
 # =========================================================
@@ -208,12 +222,12 @@ st.markdown("---")
 st.subheader("Homogenization")
 
 enable_homog = st.checkbox(
-    "Enable Homogenization (safe: groups only obvious variants like Policy Number vs Policy_number vs policynumber)",
+    "Enable Homogenization (groups only obvious variants like Policy Number / Policy_number / policynumber)",
     value=True
 )
 
 use_llm_for_canonical = st.checkbox(
-    "Use AI to pick canonical name within each group (recommended). If off, heuristic will pick canonical.",
+    "Use AI to pick canonical name within each group (optional). If off, heuristic will pick canonical.",
     value=True
 )
 
@@ -244,30 +258,40 @@ if analyze:
         st.stop()
 
     # =========================================================
-    # RAW INVENTORY you asked for:
-    # - file name is the report name
-    # - do NOT append sheet name
-    # - include ALL columns from ALL sheets (including Consolidated)
-    # - if the same column appears in multiple sheets in the same file, we keep it once for that file
+    # RAW INVENTORY (File = Report Name)
+    # - File name is the report name
+    # - Do NOT append sheet name
+    # - Include ALL columns from ALL sheets (including Consolidated)
+    # - De-dupe per file while preserving FIRST-SEEN order (no sorting, no case changes)
     # =========================================================
     st.write("## Raw Column Inventory (File = Report Name)")
     raw_rows = []
+
     for f in uploaded_files:
+        report_name = f.name  # file name ONLY
+
         try:
-            report_name = f.name  # ✅ file name only
             if f.name.lower().endswith(".csv"):
                 df = read_csv_flexible(f)
-                for col in df.columns:
-                    raw_rows.append({"report_name": report_name, "column_original": str(col)})
+                seen = set()
+                for col in list(df.columns):
+                    col_str = str(col)
+                    if col_str not in seen:
+                        raw_rows.append({"report_name": report_name, "column_original": col_str})
+                        seen.add(col_str)
+
             else:
                 xls = pd.ExcelFile(f)
-                # collect unique columns across all sheets for this file
-                cols_set = set()
+                seen = set()
+                # Sheet order is preserved as Excel provides it; we do NOT show sheet names.
                 for sheet in xls.sheet_names:
                     df = xls.parse(sheet)
-                    cols_set.update([str(c) for c in df.columns])
-                for col in sorted(cols_set, key=lambda x: (x.lower(), x)):
-                    raw_rows.append({"report_name": report_name, "column_original": col})
+                    for col in list(df.columns):
+                        col_str = str(col)
+                        if col_str not in seen:
+                            raw_rows.append({"report_name": report_name, "column_original": col_str})
+                            seen.add(col_str)
+
         except Exception as e:
             st.error(f"Could not process {f.name}: {e}")
 
@@ -279,37 +303,44 @@ if analyze:
     st.dataframe(raw_df, use_container_width=True, hide_index=True)
 
     # =========================================================
-    # Homogenization maps built from ALL distinct columns across ALL reports
-    # This ensures you don't "miss" variants like Policy_number / policynumber etc.
+    # Build homogenization maps from ALL unique columns across ALL reports
+    # - Preserve first-seen order across the entire dataset
+    # - NEVER change casing of any column name string
     # =========================================================
-    canonical_map, group_sizes, legacy_list_by_canon, group_variants_by_canon = {}, {}, {}, {}
+    canonical_map, group_sizes, legacy_list_by_canon = {}, {}, {}
+
     if enable_homog:
-        all_unique_cols = sorted(raw_df["column_original"].dropna().astype(str).unique().tolist(), key=lambda x: (x.lower(), x))
-        with st.spinner("Homogenizing (safe grouping by collapsed key)..."):
+        all_unique_cols_in_order = []
+        seen_global = set()
+        for col in raw_df["column_original"].tolist():
+            if col not in seen_global:
+                all_unique_cols_in_order.append(col)
+                seen_global.add(col)
+
+        with st.spinner("Homogenizing (safe grouping by collapsed key; no case changes)..."):
             try:
-                canonical_map, group_sizes, legacy_list_by_canon, group_variants_by_canon = run_homogenization_conservative(
-                    unique_cols=all_unique_cols,
+                canonical_map, group_sizes, legacy_list_by_canon = run_homogenization_conservative(
+                    all_unique_cols_in_order=all_unique_cols_in_order,
                     api_key=api_key,
                     llm_model=llm_model.strip(),
                     use_llm=bool(use_llm_for_canonical),
                 )
             except Exception as e:
                 st.error(f"Homogenization failed: {e}")
-                canonical_map, group_sizes, legacy_list_by_canon, group_variants_by_canon = {}, {}, {}, {}
+                canonical_map, group_sizes, legacy_list_by_canon = {}, {}, {}
 
     # =========================================================
     # Cross Tab
     # - Columns = ONLY report names (file names)
     # - Rows:
-    #    * If a group has >1 variants => show only canonical
-    #    * Else show the column itself
-    # - Cell = "x" if ANY variant for that canonical exists in that report
-    # - legacy_columns = list of legacy variants under that canonical (excluding canonical)
-    # - IMPORTANT: we still mark the report with x even if only policynumber exists there (rolled under Policy Number)
+    #    * If a group has >1 variants => show only canonical (exact variant chosen from existing names)
+    #    * Else show the column itself (exact as seen)
+    # - Cell = "x" if ANY variant under that canonical exists in the report
+    # - legacy_columns = list of legacy variants under that canonical (exact strings; no case changes)
+    # - No visible 0-based row index (reset_index + hide_index)
     # =========================================================
     st.write("## Report vs Field Cross Tab (X = Present)")
 
-    # Build a working DF from raw_df (already file-level, sheet-agnostic)
     tmp = raw_df.copy()
 
     if enable_homog and canonical_map:
@@ -319,14 +350,23 @@ if analyze:
     else:
         tmp["row_field"] = tmp["column_original"]
 
-    # Presence: if ANY original column (canonical or any legacy) appears in a report, row_field is present
-    collapsed = tmp.groupby(["row_field", "report_name"], as_index=False).size().drop(columns=["size"])
+    # Presence: any original variant implies the canonical row is present in that report
+    collapsed = (
+        tmp.groupby(["row_field", "report_name"], as_index=False)
+           .size()
+           .drop(columns=["size"])
+    )
+
     cross_counts = pd.crosstab(collapsed["row_field"], collapsed["report_name"])
     cross_tab = cross_counts.applymap(lambda v: "x" if v > 0 else "")
 
-    # legacy list column (TEXT)
+    # Add legacy_columns TEXT (exact strings)
     if enable_homog and legacy_list_by_canon:
-        legacy_series = pd.Series(cross_tab.index, index=cross_tab.index).map(lambda k: legacy_list_by_canon.get(k, "")).fillna("")
+        legacy_series = (
+            pd.Series(cross_tab.index, index=cross_tab.index)
+              .map(lambda k: legacy_list_by_canon.get(k, ""))
+              .fillna("")
+        )
     else:
         legacy_series = pd.Series([""] * len(cross_tab.index), index=cross_tab.index)
 
@@ -345,6 +385,3 @@ if analyze:
     # Remove 0-based visible index by resetting and hiding index
     cross_tab = cross_tab.reset_index().rename(columns={"row_field": "column_original"})
     st.dataframe(cross_tab, use_container_width=True, hide_index=True)
-
-# Reference file (for your internal tracking / the uploaded rtf)
-# :contentReference[oaicite:0]{index=0}
