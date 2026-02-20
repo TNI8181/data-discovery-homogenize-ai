@@ -4,6 +4,7 @@ import io
 import numpy as np
 import json
 import os
+import re
 
 # =========================================================
 # Helper: Flexible CSV Reader
@@ -50,9 +51,21 @@ def _cosine_sim_matrix(vectors: np.ndarray) -> np.ndarray:
     v = vectors / norms
     return v @ v.T
 
-def _union_find_groups(sim_mat: np.ndarray, threshold: float):
+def _collapsed_key(s: str) -> str:
     """
-    Simple connected-components grouping based on cosine similarity threshold.
+    Strong grouping key:
+    - lower
+    - remove anything that's not a-z or 0-9
+    Example: "Policy Number" == "policynumber" == "Policy_Number"
+    """
+    return re.sub(r"[^a-z0-9]+", "", str(s).strip().lower())
+
+def _union_find_groups(sim_mat: np.ndarray, threshold: float, texts: list[str]):
+    """
+    Groups columns by:
+    (A) Strong rule: same collapsed_key => same group
+    (B) Embedding similarity: cosine >= threshold => same group
+    Returns: list of groups (each group is list of indices)
     """
     n = sim_mat.shape[0]
     parent = list(range(n))
@@ -68,15 +81,30 @@ def _union_find_groups(sim_mat: np.ndarray, threshold: float):
         if ra != rb:
             parent[rb] = ra
 
+    # (A) Strong rule union
+    key_to_idxs = {}
+    for i, t in enumerate(texts):
+        k = _collapsed_key(t)
+        key_to_idxs.setdefault(k, []).append(i)
+
+    for idxs in key_to_idxs.values():
+        if len(idxs) > 1:
+            root = idxs[0]
+            for j in idxs[1:]:
+                union(root, j)
+
+    # (B) Similarity union
     for i in range(n):
         for j in range(i + 1, n):
             if sim_mat[i, j] >= threshold:
                 union(i, j)
 
+    # Collect groups
     groups = {}
     for i in range(n):
         r = find(i)
         groups.setdefault(r, []).append(i)
+
     return list(groups.values())
 
 @st.cache_data(show_spinner=False)
@@ -97,8 +125,8 @@ def _embed_texts(texts, api_key: str, embedding_model: str):
 @st.cache_data(show_spinner=False)
 def _pick_canonical_for_group(group_variants, api_key: str, llm_model: str):
     """
-    LLM returns a business-readable canonical label suggestion for the group.
-    IMPORTANT: we'll later force canonical to be one of the existing variants (no invented labels).
+    LLM suggests a business-readable canonical label for a group.
+    We'll later force canonical to be one of the existing variants (no invented labels).
     """
     from openai import OpenAI
     client = OpenAI(api_key=api_key)
@@ -203,7 +231,7 @@ def run_homogenization(unique_cols, api_key: str, embedding_model: str, llm_mode
     Returns:
       canonical_map[col] -> canonical (must be one of the original variants)
       variants_map[col]  -> comma-separated variants in its group (original text)
-      group_sizes[col]   -> size of group (used to avoid altering singletons)
+      group_sizes[col]   -> size of group
     """
     texts = list(unique_cols)
     if not texts:
@@ -211,7 +239,7 @@ def run_homogenization(unique_cols, api_key: str, embedding_model: str, llm_mode
 
     vectors = _embed_texts(texts, api_key=api_key, embedding_model=embedding_model)
     sim = _cosine_sim_matrix(vectors)
-    groups_idx = _union_find_groups(sim, threshold=threshold)
+    groups_idx = _union_find_groups(sim, threshold=threshold, texts=texts)
 
     canonical_map = {}
     variants_map = {}
@@ -227,7 +255,7 @@ def run_homogenization(unique_cols, api_key: str, embedding_model: str, llm_mode
             result = _pick_canonical_for_group(group_variants=group, api_key=api_key, llm_model=llm_model)
             llm_canon = str(result.get("canonical", "")).strip()
             canonical = _match_llm_canonical_to_existing(llm_canon, group)
-            variants = group  # preserve originals exactly as they appear
+            variants = group
 
         variants_str = ", ".join([str(v) for v in variants])
 
@@ -244,7 +272,10 @@ def run_homogenization(unique_cols, api_key: str, embedding_model: str, llm_mode
 # =========================================================
 st.set_page_config(page_title="Insurance Data Discovery", layout="wide")
 st.title("Insurance Data Discovery Tool (Module 1)")
-st.caption("Upload sample reports (Excel/CSV). We will extract column metadata, build a field inventory, and produce a cross-tab. Optional AI homogenization groups similar fields.")
+st.caption(
+    "Upload sample reports (Excel/CSV). We extract column metadata, build a field inventory, "
+    "and produce a cross-tab. Optional AI homogenization groups similar fields and moves variants into legacy_columns."
+)
 
 source_system = st.text_input("Source System Name (e.g., Legacy PAS, Mainframe Claims)")
 
@@ -258,7 +289,7 @@ st.markdown("---")
 st.subheader("Homogenization (AI)")
 
 enable_homog = st.checkbox(
-    "Enable AI Homogenization (group similar columns; keep only one variant in column_original and move other variants to legacy_columns)",
+    "Enable AI Homogenization (Policy Number + policynumber => keep best in column_original, move others to legacy_columns)",
     value=True
 )
 
@@ -374,8 +405,7 @@ if analyze:
     canonical_map, variants_map, group_sizes = {}, {}, {}
     if enable_homog and not field_df.empty:
         unique_cols = sorted(field_df["column_original"].dropna().astype(str).unique().tolist())
-
-        with st.spinner("Running AI homogenization (embeddings + grouping + canonical naming)..."):
+        with st.spinner("Running AI homogenization (strong rule + embeddings + canonical selection)..."):
             try:
                 canonical_map, variants_map, group_sizes = run_homogenization(
                     unique_cols=unique_cols,
@@ -390,15 +420,6 @@ if analyze:
 
     # -------------------------------
     # Cross Tab (Requested Output)
-    #
-    # REQUIREMENT:
-    # - column_original shows all original distinct fields EXCEPT:
-    #     * variants that were homogenized away
-    # - For a homogenized group (>1):
-    #     * keep ONLY the chosen canonical (which is one of the originals)
-    #     * put the OTHER variants in legacy_columns (comma-separated)
-    # - Presence: if any variant appears in a report, canonical is "x" for that report
-    # - Add Repetition Count + Totals row
     # -------------------------------
     st.write("## Report vs Field Cross Tab (X = Present)")
 
@@ -407,7 +428,7 @@ if analyze:
         tmp["canonical"] = tmp["column_original"].map(canonical_map).fillna(tmp["column_original"])
         tmp["group_size"] = tmp["column_original"].map(group_sizes).fillna(1).astype(int)
 
-        # canonical -> variants set (only for groups > 1)
+        # Build canonical -> variants set (only for groups > 1)
         canonical_to_variants = {}
         for orig in tmp["column_original"].dropna().astype(str).unique():
             size = group_sizes.get(orig, 1)
@@ -425,11 +446,11 @@ if analyze:
             legacy_only = sorted([v for v in varset if str(v).strip().lower() != canon_norm])
             canonical_to_legacy[canon] = ", ".join(legacy_only)
 
-        # Keep all singletons as-is; for groups>1 keep ONLY the canonical row(s)
+        # Keep all singletons as-is; for groups>1 keep ONLY canonical rows
         keep_mask = (tmp["group_size"] <= 1) | (tmp["column_original"].astype(str) == tmp["canonical"].astype(str))
         tmp_kept = tmp.loc[keep_mask].copy()
 
-        # Ensure kept rows show the canonical text (existing variant) in column_original
+        # Ensure canonical is what we display for homogenized groups
         tmp_kept.loc[tmp_kept["group_size"] > 1, "column_original"] = tmp_kept.loc[tmp_kept["group_size"] > 1, "canonical"]
 
         # Collapse presence to one per (report_name, column_original)
@@ -445,11 +466,11 @@ if analyze:
             value=cross_tab.index.to_series().map(canonical_to_legacy).fillna("")
         )
 
-        # repetition across report columns only
+        # Repetition Count across report columns only
         report_cols = [c for c in cross_tab.columns if c not in ["legacy_columns", "Repetition Count"]]
         cross_tab["Repetition Count"] = (cross_tab[report_cols] == "x").sum(axis=1)
 
-        # totals
+        # Totals row
         totals = (cross_tab[report_cols] == "x").sum(axis=0)
         totals["legacy_columns"] = ""
         totals["Repetition Count"] = int(cross_tab["Repetition Count"].sum())
