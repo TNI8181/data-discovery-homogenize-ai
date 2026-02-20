@@ -390,7 +390,7 @@ if analyze:
                 xls = pd.ExcelFile(f)
                 for sheet in xls.sheet_names:
                     df = xls.parse(sheet)
-                    report_label = f"{f.name} | {sheet}"
+                    report_label = f"{f.name}"
                     for col in df.columns:
                         field_rows.append({"report_name": report_label, "column_original": str(col)})
         except Exception as e:
