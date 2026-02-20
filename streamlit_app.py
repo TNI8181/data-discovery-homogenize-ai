@@ -24,6 +24,7 @@ def read_csv_flexible(uploaded_file):
     except Exception:
         df = None
 
+    # If it parsed into a single column, likely "whole-row quoted" CSV
     if df is None or df.shape[1] == 1:
         uploaded_file.seek(0)
         raw = uploaded_file.read()
@@ -79,7 +80,7 @@ def _union_find_groups(sim_mat: np.ndarray, threshold: float, texts: list[str]):
         if ra != rb:
             parent[rb] = ra
 
-    # (A) Strong rule union
+    # (A) Strong rule unions
     key_to_idxs = {}
     for i, t in enumerate(texts):
         key_to_idxs.setdefault(_collapsed_key(t), []).append(i)
@@ -89,12 +90,13 @@ def _union_find_groups(sim_mat: np.ndarray, threshold: float, texts: list[str]):
             for j in idxs[1:]:
                 union(root, j)
 
-    # (B) Similarity union
+    # (B) Similarity unions
     for i in range(n):
         for j in range(i + 1, n):
             if sim_mat[i, j] >= threshold:
                 union(i, j)
 
+    # Collect groups
     groups = {}
     for i in range(n):
         r = find(i)
@@ -263,7 +265,7 @@ st.markdown("---")
 st.subheader("Homogenization (AI)")
 
 enable_homog = st.checkbox(
-    "Enable AI Homogenization (Policy Number + policynumber => keep best, mark legacy)",
+    "Enable AI Homogenization (Policy Number + policynumber => keep best, roll variants into legacy_columns)",
     value=True
 )
 
@@ -338,9 +340,8 @@ if analyze:
     st.dataframe(pd.DataFrame(profile_rows), use_container_width=True, hide_index=True)
 
     # -------------------------------
-    # Field Inventory (Raw)
+    # Build Field Inventory (Raw)
     # -------------------------------
-    st.write("## Field Inventory (Raw)")
     field_rows = []
     for f in uploaded_files:
         try:
@@ -351,7 +352,7 @@ if analyze:
                     field_rows.append({"report_name": report_label, "column_original": str(col)})
             else:
                 xls = pd.ExcelFile(f)
-                report_label = f.name  # treat file as report name
+                report_label = f.name
                 for sheet in xls.sheet_names:
                     df = xls.parse(sheet)
                     for col in df.columns:
@@ -360,7 +361,6 @@ if analyze:
             st.error(f"Could not process {f.name}: {e}")
 
     field_df = pd.DataFrame(field_rows)
-    st.dataframe(field_df, use_container_width=True, hide_index=True)
 
     # -------------------------------
     # AI Homogenization: Build maps
@@ -382,18 +382,15 @@ if analyze:
                 canonical_map, variants_map, group_sizes = {}, {}, {}
 
     # =========================================================
-    # Cross Tab (ONLY report names as columns)
+    # Cross Tab (Report columns only) + legacy_columns list
     #
     # Requirements implemented:
-    # - Columns = only report names (no "report (legacy)" columns)
-    # - Rows = business field names (canonical where grouping happened; otherwise the original)
+    # - Columns = only report names
+    # - Rows = canonical name for a homogenized group, else original field
     # - Cell = "x" if ANY variant (canonical or legacy) appears in that report
-    # - Add a column named legacy_columns that contains ONLY "x" when:
-    #     * field was homogenized (group_size>1)
-    #     * AND the group spans >= 2 distinct reports
-    #     * AND at least one non-canonical variant exists in the group
-    # - Repetition Count = count of "x" across report columns
-    # - Totals row = count of "x" per report + repetition total
+    # - legacy_columns (TEXT) = list of legacy variants for that canonical (comma-separated)
+    # - Repetition Count = count of x across report columns
+    # - Totals row included
     # =========================================================
     st.write("## Report vs Field Cross Tab (X = Present)")
 
@@ -403,38 +400,32 @@ if analyze:
         tmp["group_size"] = tmp["column_original"].map(group_sizes).fillna(1).astype(int)
         tmp["row_field"] = np.where(tmp["group_size"] > 1, tmp["canonical"], tmp["column_original"])
 
+        # For each canonical, build full variant set (as found in dataset) and then legacy list (exclude canonical itself)
+        canonical_to_variants = {}
+        for _, r in tmp.iterrows():
+            if int(r["group_size"]) <= 1:
+                continue
+            canon = str(r["canonical"])
+            original = str(r["column_original"])
+            canonical_to_variants.setdefault(canon, set()).add(original)
+
+        canonical_to_legacy_list = {}
+        for canon, varset in canonical_to_variants.items():
+            canon_norm = canon.strip().lower()
+            legacy = sorted([v for v in varset if v.strip().lower() != canon_norm])
+            canonical_to_legacy_list[canon] = ", ".join(legacy)
+
         # Presence across variants: collapse to (row_field, report_name)
         collapsed = tmp.groupby(["row_field", "report_name"], as_index=False).size().drop(columns=["size"])
 
         cross_counts = pd.crosstab(collapsed["row_field"], collapsed["report_name"])
         cross_tab = cross_counts.applymap(lambda v: "x" if v > 0 else "")
 
-        # legacy_columns = "x" when homogenized across >=2 reports and has legacy variants
-        # Build per canonical: reports involved + whether legacy variants exist
-        # (A legacy variant exists if group has any original != canonical)
-        canon_stats = (
-            tmp[tmp["group_size"] > 1]
-            .groupby("canonical")
-            .agg(
-                reports=("report_name", lambda s: sorted(set(map(str, s)))),
-                variants=("column_original", lambda s: sorted(set(map(str, s))))
-            )
-        )
-
-        legacy_flag = {}
-        for canon, row in canon_stats.iterrows():
-            reports = row["reports"]
-            variants = row["variants"]
-            canon_norm = str(canon).strip().lower()
-            has_legacy = any(str(v).strip().lower() != canon_norm for v in variants)
-            spans_2_reports = len(reports) >= 2
-            legacy_flag[canon] = "x" if (has_legacy and spans_2_reports) else ""
-
-        # Insert legacy_columns right after the row label
+        # Insert legacy list column (TEXT, not "x")
         cross_tab.insert(
             loc=0,
             column="legacy_columns",
-            value=pd.Series(cross_tab.index, index=cross_tab.index).map(lambda k: legacy_flag.get(k, "")).fillna("")
+            value=pd.Series(cross_tab.index, index=cross_tab.index).map(lambda k: canonical_to_legacy_list.get(k, "")).fillna("")
         )
 
         # Repetition Count across report columns only
