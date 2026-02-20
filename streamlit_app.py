@@ -43,25 +43,18 @@ def read_csv_flexible(uploaded_file):
 
 
 # =========================================================
-# Homogenization (Conservative)
-# - Primary grouping rule: SAME collapsed_key => same group
-# - This avoids over-grouping and fixes incorrect cross-tabs
-# - LLM ONLY picks the canonical WITHIN each group (no invented labels)
+# Homogenization (Safer / Less Overboard)
+# 1) Hard grouping by "collapsed_key" (Policy Number == policy_number == policynumber)
+# 2) Optional AI only to choose canonical WITHIN that group
+# 3) Never groups unrelated fields
 # =========================================================
 def _collapsed_key(s: str) -> str:
-    """
-    Very conservative grouping key:
-    - lower
-    - remove anything that's not a-z or 0-9
-    Examples:
-      "Policy Number" == "policynumber" == "Policy_Number"
-    """
     return re.sub(r"[^a-z0-9]+", "", str(s).strip().lower())
 
 def _pick_best_existing_variant(variants):
     """
-    Choose the most business-readable variant FROM the existing variants.
-    Preference: spaces + Title Case-ish, avoid underscores/dashes, avoid all-lower/all-upper.
+    Choose most business-readable label among existing variants.
+    Preference: spaces + Title Case-ish, avoid underscores/dashes.
     """
     def score(v: str) -> tuple:
         s = str(v).strip()
@@ -139,9 +132,6 @@ Variants:
         return {"canonical": group_variants[0], "variants": group_variants}
 
 def _match_llm_canonical_to_existing(llm_canonical: str, variants):
-    """
-    Force canonical to be one of the existing variants.
-    """
     if not variants:
         return str(llm_canonical).strip()
 
@@ -153,17 +143,17 @@ def _match_llm_canonical_to_existing(llm_canonical: str, variants):
 
 def run_homogenization_conservative(unique_cols, api_key: str, llm_model: str, use_llm: bool):
     """
-    Conservative grouping: ONLY collapsed_key equality.
+    Conservative grouping ONLY by collapsed_key equality.
     Returns:
       canonical_map[col] -> canonical (one of original variants)
       group_sizes[col]   -> size of group
       legacy_list_by_canon[canonical] -> "a, b, c" (excluding canonical itself)
+      group_variants_by_canon[canonical] -> set(all variants, including canonical)
     """
-    texts = list(unique_cols)
+    texts = [str(x) for x in unique_cols if str(x).strip() != ""]
     if not texts:
-        return {}, {}, {}
+        return {}, {}, {}, {}
 
-    # Group by collapsed_key
     key_to_group = {}
     for t in texts:
         key_to_group.setdefault(_collapsed_key(t), []).append(t)
@@ -171,29 +161,32 @@ def run_homogenization_conservative(unique_cols, api_key: str, llm_model: str, u
     canonical_map = {}
     group_sizes = {}
     legacy_list_by_canon = {}
+    group_variants_by_canon = {}
 
     for _, group in key_to_group.items():
         group = [str(x) for x in group]
-        if len(group) == 1:
-            canon = group[0]
+        uniq_group = sorted(set(group), key=lambda x: (x.lower(), x))
+
+        if len(uniq_group) == 1:
+            canon = uniq_group[0]
         else:
             if use_llm:
-                result = _pick_canonical_for_group_llm(group_variants=group, api_key=api_key, llm_model=llm_model)
+                result = _pick_canonical_for_group_llm(group_variants=uniq_group, api_key=api_key, llm_model=llm_model)
                 llm_canon = str(result.get("canonical", "")).strip()
-                canon = _match_llm_canonical_to_existing(llm_canon, group)
+                canon = _match_llm_canonical_to_existing(llm_canon, uniq_group)
             else:
-                canon = _pick_best_existing_variant(group)
+                canon = _pick_best_existing_variant(uniq_group)
 
-        # legacy list for this canonical (exclude canonical itself, case-insensitive)
         canon_norm = canon.strip().lower()
-        legacy_only = sorted([v for v in set(group) if v.strip().lower() != canon_norm])
+        legacy_only = sorted([v for v in uniq_group if v.strip().lower() != canon_norm])
         legacy_list_by_canon[canon] = ", ".join(legacy_only)
+        group_variants_by_canon[canon] = set(uniq_group)
 
-        for v in group:
+        for v in uniq_group:
             canonical_map[v] = canon
-            group_sizes[v] = len(group)
+            group_sizes[v] = len(uniq_group)
 
-    return canonical_map, group_sizes, legacy_list_by_canon
+    return canonical_map, group_sizes, legacy_list_by_canon, group_variants_by_canon
 
 
 # =========================================================
@@ -215,7 +208,7 @@ st.markdown("---")
 st.subheader("Homogenization")
 
 enable_homog = st.checkbox(
-    "Enable Homogenization (conservative: groups only obvious variants like Policy Number vs policy_number vs policynumber)",
+    "Enable Homogenization (safe: groups only obvious variants like Policy Number vs Policy_number vs policynumber)",
     value=True
 )
 
@@ -250,98 +243,75 @@ if analyze:
         st.warning("AI canonical selection is enabled. Please provide an OpenAI API key (or turn off AI canonical selection).")
         st.stop()
 
-    # -------------------------------
-    # Quick Profiling (includes ALL sheets, including Consolidated)
-    # -------------------------------
-    st.write("## Quick Profiling (Preview)")
-    profile_rows = []
+    # =========================================================
+    # RAW INVENTORY you asked for:
+    # - file name is the report name
+    # - do NOT append sheet name
+    # - include ALL columns from ALL sheets (including Consolidated)
+    # - if the same column appears in multiple sheets in the same file, we keep it once for that file
+    # =========================================================
+    st.write("## Raw Column Inventory (File = Report Name)")
+    raw_rows = []
     for f in uploaded_files:
         try:
+            report_name = f.name  # ✅ file name only
             if f.name.lower().endswith(".csv"):
                 df = read_csv_flexible(f)
-                profile_rows.append({
-                    "report_name": f.name,
-                    "rows": int(len(df)),
-                    "columns": int(len(df.columns)),
-                    "sample_columns": ", ".join([str(c) for c in df.columns[:12]])
-                })
-            else:
-                xls = pd.ExcelFile(f)
-                for sheet in xls.sheet_names:
-                    df = xls.parse(sheet)
-                    profile_rows.append({
-                        "report_name": f"{f.name} | {sheet}",  # ✅ includes Consolidated explicitly
-                        "rows": int(len(df)),
-                        "columns": int(len(df.columns)),
-                        "sample_columns": ", ".join([str(c) for c in df.columns[:12]])
-                    })
-        except Exception as e:
-            st.error(f"Could not read {f.name}: {e}")
-
-    st.dataframe(pd.DataFrame(profile_rows), use_container_width=True, hide_index=True)
-
-    # -------------------------------
-    # Build Field Inventory (Raw) (includes ALL sheets)
-    # -------------------------------
-    field_rows = []
-    for f in uploaded_files:
-        try:
-            if f.name.lower().endswith(".csv"):
-                df = read_csv_flexible(f)
-                report_label = f.name
                 for col in df.columns:
-                    field_rows.append({"report_name": report_label, "column_original": str(col)})
+                    raw_rows.append({"report_name": report_name, "column_original": str(col)})
             else:
                 xls = pd.ExcelFile(f)
+                # collect unique columns across all sheets for this file
+                cols_set = set()
                 for sheet in xls.sheet_names:
                     df = xls.parse(sheet)
-                    report_label = f"{f.name} | {sheet}"  # ✅ includes Consolidated explicitly
-                    for col in df.columns:
-                        field_rows.append({"report_name": report_label, "column_original": str(col)})
+                    cols_set.update([str(c) for c in df.columns])
+                for col in sorted(cols_set, key=lambda x: (x.lower(), x)):
+                    raw_rows.append({"report_name": report_name, "column_original": col})
         except Exception as e:
             st.error(f"Could not process {f.name}: {e}")
 
-    field_df = pd.DataFrame(field_rows)
-    if field_df.empty:
+    raw_df = pd.DataFrame(raw_rows)
+    if raw_df.empty:
         st.warning("No columns found in uploaded files.")
         st.stop()
 
-    # -------------------------------
-    # Homogenization maps (conservative)
-    # -------------------------------
-    canonical_map = {}
-    group_sizes = {}
-    legacy_list_by_canon = {}
+    st.dataframe(raw_df, use_container_width=True, hide_index=True)
 
+    # =========================================================
+    # Homogenization maps built from ALL distinct columns across ALL reports
+    # This ensures you don't "miss" variants like Policy_number / policynumber etc.
+    # =========================================================
+    canonical_map, group_sizes, legacy_list_by_canon, group_variants_by_canon = {}, {}, {}, {}
     if enable_homog:
-        unique_cols = sorted(field_df["column_original"].dropna().astype(str).unique().tolist())
-        with st.spinner("Homogenizing (conservative grouping)..."):
+        all_unique_cols = sorted(raw_df["column_original"].dropna().astype(str).unique().tolist(), key=lambda x: (x.lower(), x))
+        with st.spinner("Homogenizing (safe grouping by collapsed key)..."):
             try:
-                canonical_map, group_sizes, legacy_list_by_canon = run_homogenization_conservative(
-                    unique_cols=unique_cols,
+                canonical_map, group_sizes, legacy_list_by_canon, group_variants_by_canon = run_homogenization_conservative(
+                    unique_cols=all_unique_cols,
                     api_key=api_key,
                     llm_model=llm_model.strip(),
                     use_llm=bool(use_llm_for_canonical),
                 )
             except Exception as e:
                 st.error(f"Homogenization failed: {e}")
-                canonical_map, group_sizes, legacy_list_by_canon = {}, {}, {}
+                canonical_map, group_sizes, legacy_list_by_canon, group_variants_by_canon = {}, {}, {}, {}
 
     # =========================================================
     # Cross Tab
-    #
-    # ✅ Correctness goals:
-    # - Columns = ONLY report names (sheet-aware, includes Consolidated)
+    # - Columns = ONLY report names (file names)
     # - Rows:
-    #    * If a group has >1 variants => show only the chosen canonical as the row (column_original)
+    #    * If a group has >1 variants => show only canonical
     #    * Else show the column itself
-    # - Cell = "x" if ANY variant belonging to that canonical group exists in that report
-    # - legacy_columns = text list of the variants that were rolled up under that canonical (excluding the canonical itself)
-    # - No row numbers starting at 0: we output index as a real column (reset_index) and hide pandas index
+    # - Cell = "x" if ANY variant for that canonical exists in that report
+    # - legacy_columns = list of legacy variants under that canonical (excluding canonical)
+    # - IMPORTANT: we still mark the report with x even if only policynumber exists there (rolled under Policy Number)
     # =========================================================
     st.write("## Report vs Field Cross Tab (X = Present)")
 
-    tmp = field_df.copy()
+    # Build a working DF from raw_df (already file-level, sheet-agnostic)
+    tmp = raw_df.copy()
+
     if enable_homog and canonical_map:
         tmp["canonical"] = tmp["column_original"].map(canonical_map).fillna(tmp["column_original"])
         tmp["group_size"] = tmp["column_original"].map(group_sizes).fillna(1).astype(int)
@@ -349,12 +319,12 @@ if analyze:
     else:
         tmp["row_field"] = tmp["column_original"]
 
-    # Presence across variants: one row per (row_field, report_name) if any variant exists
+    # Presence: if ANY original column (canonical or any legacy) appears in a report, row_field is present
     collapsed = tmp.groupby(["row_field", "report_name"], as_index=False).size().drop(columns=["size"])
     cross_counts = pd.crosstab(collapsed["row_field"], collapsed["report_name"])
     cross_tab = cross_counts.applymap(lambda v: "x" if v > 0 else "")
 
-    # Insert legacy list column (TEXT)
+    # legacy list column (TEXT)
     if enable_homog and legacy_list_by_canon:
         legacy_series = pd.Series(cross_tab.index, index=cross_tab.index).map(lambda k: legacy_list_by_canon.get(k, "")).fillna("")
     else:
@@ -362,7 +332,7 @@ if analyze:
 
     cross_tab.insert(0, "legacy_columns", legacy_series)
 
-    # Repetition Count (report columns only)
+    # Repetition Count across report columns only
     report_cols = [c for c in cross_tab.columns if c != "legacy_columns"]
     cross_tab["Repetition Count"] = (cross_tab[report_cols] == "x").sum(axis=1)
 
@@ -372,7 +342,9 @@ if analyze:
     totals["Repetition Count"] = int(cross_tab["Repetition Count"].sum())
     cross_tab.loc["Totals"] = totals
 
-    # Make row_field a real column to avoid 0-based row index display
+    # Remove 0-based visible index by resetting and hiding index
     cross_tab = cross_tab.reset_index().rename(columns={"row_field": "column_original"})
-
     st.dataframe(cross_tab, use_container_width=True, hide_index=True)
+
+# Reference file (for your internal tracking / the uploaded rtf)
+# :contentReference[oaicite:0]{index=0}
