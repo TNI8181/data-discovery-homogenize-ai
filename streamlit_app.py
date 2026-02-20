@@ -24,7 +24,6 @@ def read_csv_flexible(uploaded_file):
     except Exception:
         df = None
 
-    # If it parsed into a single column, likely "whole-row quoted" CSV
     if df is None or df.shape[1] == 1:
         uploaded_file.seek(0)
         raw = uploaded_file.read()
@@ -99,7 +98,6 @@ def _union_find_groups(sim_mat: np.ndarray, threshold: float, texts: list[str]):
             if sim_mat[i, j] >= threshold:
                 union(i, j)
 
-    # Collect groups
     groups = {}
     for i in range(n):
         r = find(i)
@@ -109,10 +107,6 @@ def _union_find_groups(sim_mat: np.ndarray, threshold: float, texts: list[str]):
 
 @st.cache_data(show_spinner=False)
 def _embed_texts(texts, api_key: str, embedding_model: str):
-    """
-    Returns embeddings as a numpy array in same order as texts.
-    Cached by (texts, embedding_model). api_key included only for cache signature stability.
-    """
     try:
         from openai import OpenAI
     except Exception as e:
@@ -167,7 +161,6 @@ Variants:
         }
     )
 
-    # Prefer structured parse; fallback to JSON text
     try:
         parsed = response.output_parsed
         if isinstance(parsed, dict):
@@ -213,8 +206,6 @@ def _pick_best_existing_variant(variants):
 def _match_llm_canonical_to_existing(llm_canonical: str, variants):
     """
     Force canonical to be one of the existing variants.
-    - If LLM canonical matches an existing variant (case-insensitive), return that exact variant.
-    - Else return best existing variant by heuristic.
     """
     if not variants:
         return str(llm_canonical).strip()
@@ -293,7 +284,6 @@ enable_homog = st.checkbox(
     value=True
 )
 
-# Prefer secrets/env; allow UI override
 api_key = (st.secrets.get("OPENAI_API_KEY", "") if hasattr(st, "secrets") else "") or os.getenv("OPENAI_API_KEY", "")
 api_key_ui = st.text_input("OpenAI API Key (optional if set in Secrets/env)", type="password")
 api_key = (api_key_ui.strip() or api_key.strip())
@@ -378,7 +368,6 @@ if analyze:
     # -------------------------------
     st.write("## Field Inventory (Raw)")
     field_rows = []
-
     for f in uploaded_files:
         try:
             if f.name.lower().endswith(".csv"):
@@ -388,9 +377,9 @@ if analyze:
                     field_rows.append({"report_name": report_label, "column_original": str(col)})
             else:
                 xls = pd.ExcelFile(f)
+                report_label = f.name
                 for sheet in xls.sheet_names:
                     df = xls.parse(sheet)
-                    report_label = f"{f.name}"
                     for col in df.columns:
                         field_rows.append({"report_name": report_label, "column_original": str(col)})
         except Exception as e:
@@ -418,76 +407,51 @@ if analyze:
                 st.error(f"Homogenization failed: {e}")
                 canonical_map, variants_map, group_sizes = {}, {}, {}
 
-  # ================================
-# Cross Tab (Canonical + Legacy cross-tab per report)
-# WHAT CHANGED:
-# - We STILL keep ONE row per business field (canonical shown as column_original)
-# - BUT we ALSO "cross-tab" legacy usage per report:
-#     For each report you will now see TWO columns:
-#       1) <Report Name>                -> "x" if the canonical itself is present in that report
-#       2) <Report Name> (Legacy Used)  -> comma-separated legacy variants that appeared in that report
-# - This way, legacy columns are NOT ignored — you can see exactly where they occur.
-# ================================
-st.write("## Report vs Field Cross Tab (Canonical + Legacy Usage)")
+    # =========================================================
+    # Cross Tab (Canonical + Legacy Usage PER REPORT)
+    # =========================================================
+    st.write("## Report vs Field Cross Tab (Canonical + Legacy Usage)")
 
-if not field_df.empty:
-    if enable_homog and canonical_map:
+    if not field_df.empty and enable_homog and canonical_map:
         tmp = field_df.copy()
-
-        # Map each original to its canonical (canonical is one of the originals)
         tmp["canonical"] = tmp["column_original"].map(canonical_map).fillna(tmp["column_original"])
         tmp["group_size"] = tmp["column_original"].map(group_sizes).fillna(1).astype(int)
-
-        # Display field (row label): canonical for groups>1, else original itself
         tmp["display_field"] = np.where(tmp["group_size"] > 1, tmp["canonical"], tmp["column_original"])
 
-        # Build overall legacy list per canonical (for the legacy_columns column on the left)
+        # canonical -> variants set (only groups > 1)
         canonical_to_variants = {}
         for orig in tmp["column_original"].dropna().astype(str).unique():
-            size = group_sizes.get(orig, 1)
-            if size <= 1:
+            if group_sizes.get(orig, 1) <= 1:
                 continue
             canon = canonical_map.get(orig, orig)
             v_str = variants_map.get(orig, orig)
             parts = [p.strip() for p in str(v_str).split(",") if p.strip()]
             canonical_to_variants.setdefault(canon, set()).update(parts)
 
+        # canonical -> legacy (exclude canonical itself)
         canonical_to_legacy = {}
         for canon, varset in canonical_to_variants.items():
             canon_norm = str(canon).strip().lower()
             legacy_only = sorted([v for v in varset if str(v).strip().lower() != canon_norm])
             canonical_to_legacy[canon] = ", ".join(legacy_only)
 
-        # For singletons, legacy_columns should be blank
-        # (because there's nothing to homogenize)
         def overall_legacy_for_display(display_field: str) -> str:
             return canonical_to_legacy.get(display_field, "")
 
-        # ---- Per report x legacy usage aggregation ----
-        # For each (report_name, display_field) compute:
-        # - canonical_present: did the canonical itself appear in this report?
-        # - legacy_used: which legacy variants appeared in this report?
+        # per (report_name, display_field)
         def agg_group(g: pd.DataFrame) -> pd.Series:
-            display = g["display_field"].iloc[0]
-            # If group_size==1, treat as canonical
-            if int(g["group_size"].iloc[0]) <= 1:
+            gsize = int(g["group_size"].iloc[0])
+            if gsize <= 1:
                 return pd.Series({"canonical_present": True, "legacy_used": ""})
 
-            canon = g["canonical"].iloc[0]
-            canon_norm = str(canon).strip().lower()
+            canon = str(g["canonical"].iloc[0]).strip()
+            canon_norm = canon.lower()
 
-            canon_present = any(str(x).strip().lower() == canon_norm for x in g["column_original"].tolist())
+            originals = [str(x).strip() for x in g["column_original"].tolist()]
+            canon_present = any(x.lower() == canon_norm for x in originals)
 
-            legacy_hits = sorted({
-                str(x).strip()
-                for x in g["column_original"].tolist()
-                if str(x).strip().lower() != canon_norm
-            })
-
-            return pd.Series({
-                "canonical_present": bool(canon_present),
-                "legacy_used": ", ".join(legacy_hits)
-            })
+            legacy_hits = sorted({x for x in originals if x.lower() != canon_norm})
+            return pd.Series({"canonical_present": bool(canon_present), "legacy_used": ", ".join(legacy_hits)})
 
         agg = (
             tmp.groupby(["report_name", "display_field"], as_index=False)
@@ -495,24 +459,69 @@ if not field_df.empty:
                .reset_index(drop=True)
         )
 
-        # Build a wide table with TWO columns per report
         reports = sorted(agg["report_name"].unique().tolist())
         fields = sorted(agg["display_field"].unique().tolist())
 
-        # Start base table indexed by display_field (this is what user sees as column_original)
         cross_tab = pd.DataFrame(index=fields)
         cross_tab.index.name = "column_original"
 
-        # Add overall legacy_columns next to column_original
         cross_tab.insert(
             loc=0,
             column="legacy_columns",
             value=pd.Series(fields, index=fields).map(overall_legacy_for_display).fillna("")
         )
 
-        # Fill report columns
+        # ✅ FIXED: fill both report columns correctly
         for r in reports:
             sub = agg[agg["report_name"] == r].set_index("display_field")
 
-            # Canonical X column
-            cross_tab[r]
+            # canonical present
+            cross_tab[r] = (
+                sub["canonical_present"]
+                .reindex(fields)
+                .fillna(False)
+                .map(lambda b: "x" if bool(b) else "")
+            )
+
+            # legacy used in that report
+            cross_tab[f"{r} (Legacy Used)"] = (
+                sub["legacy_used"]
+                .reindex(fields)
+                .fillna("")
+            )
+
+        # repetition count: reports where canonical present OR legacy used
+        rep_counts = []
+        for f in fields:
+            cnt = 0
+            for r in reports:
+                canon_x = (cross_tab.at[f, r] == "x")
+                legacy_used = (str(cross_tab.at[f, f"{r} (Legacy Used)"]).strip() != "")
+                if canon_x or legacy_used:
+                    cnt += 1
+            rep_counts.append(cnt)
+        cross_tab["Repetition Count"] = rep_counts
+
+        # totals row
+        totals = {"legacy_columns": ""}
+        for r in reports:
+            totals[r] = int((cross_tab[r] == "x").sum())
+            totals[f"{r} (Legacy Used)"] = int((cross_tab[f"{r} (Legacy Used)"].astype(str).str.strip() != "").sum())
+        totals["Repetition Count"] = int(cross_tab["Repetition Count"].sum())
+        cross_tab.loc["Totals"] = totals
+
+        st.dataframe(cross_tab, use_container_width=True)
+
+    else:
+        # fallback: raw crosstab
+        cross_counts = pd.crosstab(field_df["column_original"], field_df["report_name"])
+        cross_tab = cross_counts.applymap(lambda v: "x" if v > 0 else "")
+
+        cross_tab["Repetition Count"] = (cross_tab == "x").sum(axis=1)
+
+        totals = (cross_tab == "x").sum(axis=0)
+        totals["Repetition Count"] = int(cross_tab["Repetition Count"].sum())
+        cross_tab.loc["Totals"] = totals
+
+        cross_tab.index.name = "column_original"
+        st.dataframe(cross_tab, use_container_width=True)
