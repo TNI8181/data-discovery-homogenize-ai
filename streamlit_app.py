@@ -24,6 +24,7 @@ def read_csv_flexible(uploaded_file):
     except Exception:
         df = None
 
+    # If it parsed into a single column, likely "whole-row quoted" CSV
     if df is None or df.shape[1] == 1:
         uploaded_file.seek(0)
         raw = uploaded_file.read()
@@ -64,7 +65,6 @@ def _union_find_groups(sim_mat: np.ndarray, threshold: float, texts: list[str]):
     Groups columns by:
     (A) Strong rule: same collapsed_key => same group
     (B) Embedding similarity: cosine >= threshold => same group
-    Returns: list of groups (each group is list of indices)
     """
     n = sim_mat.shape[0]
     parent = list(range(n))
@@ -80,29 +80,27 @@ def _union_find_groups(sim_mat: np.ndarray, threshold: float, texts: list[str]):
         if ra != rb:
             parent[rb] = ra
 
-    # (A) Strong rule union
+    # (A) Strong-rule unions
     key_to_idxs = {}
     for i, t in enumerate(texts):
-        k = _collapsed_key(t)
-        key_to_idxs.setdefault(k, []).append(i)
-
+        key_to_idxs.setdefault(_collapsed_key(t), []).append(i)
     for idxs in key_to_idxs.values():
         if len(idxs) > 1:
             root = idxs[0]
             for j in idxs[1:]:
                 union(root, j)
 
-    # (B) Similarity union
+    # (B) Similarity unions
     for i in range(n):
         for j in range(i + 1, n):
             if sim_mat[i, j] >= threshold:
                 union(i, j)
 
+    # Collect groups
     groups = {}
     for i in range(n):
         r = find(i)
         groups.setdefault(r, []).append(i)
-
     return list(groups.values())
 
 @st.cache_data(show_spinner=False)
@@ -152,13 +150,7 @@ Variants:
     response = client.responses.create(
         model=llm_model,
         input=prompt,
-        text={
-            "format": {
-                "name": "homogenization_result",
-                "type": "json_schema",
-                "schema": schema
-            }
-        }
+        text={"format": {"name": "homogenization_result", "type": "json_schema", "schema": schema}},
     )
 
     try:
@@ -206,6 +198,8 @@ def _pick_best_existing_variant(variants):
 def _match_llm_canonical_to_existing(llm_canonical: str, variants):
     """
     Force canonical to be one of the existing variants.
+    - If LLM canonical matches an existing variant (case-insensitive), return that exact variant.
+    - Else return best existing variant by heuristic.
     """
     if not variants:
         return str(llm_canonical).strip()
@@ -284,6 +278,7 @@ enable_homog = st.checkbox(
     value=True
 )
 
+# Prefer secrets/env; allow UI override
 api_key = (st.secrets.get("OPENAI_API_KEY", "") if hasattr(st, "secrets") else "") or os.getenv("OPENAI_API_KEY", "")
 api_key_ui = st.text_input("OpenAI API Key (optional if set in Secrets/env)", type="password")
 api_key = (api_key_ui.strip() or api_key.strip())
@@ -335,7 +330,6 @@ if analyze:
     # -------------------------------
     st.write("## Quick Profiling (Preview)")
     profile_rows = []
-
     for f in uploaded_files:
         try:
             if f.name.lower().endswith(".csv"):
@@ -377,7 +371,7 @@ if analyze:
                     field_rows.append({"report_name": report_label, "column_original": str(col)})
             else:
                 xls = pd.ExcelFile(f)
-                report_label = f.name
+                report_label = f.name  # treat file as report
                 for sheet in xls.sheet_names:
                     df = xls.parse(sheet)
                     for col in df.columns:
@@ -408,9 +402,17 @@ if analyze:
                 canonical_map, variants_map, group_sizes = {}, {}, {}
 
     # =========================================================
-    # Cross Tab (Canonical + Legacy Usage PER REPORT)
+    # Cross Tab (Canonical + Legacy Presence PER REPORT)
+    #
+    # CHANGE REQUEST:
+    # - Do NOT put actual legacy field names in the cross-tab cells.
+    # - Use "x" for BOTH:
+    #     * canonical present in that report
+    #     * legacy present in that report
+    #
+    # You still get an overall "legacy_columns" list on the left (full list of variants).
     # =========================================================
-    st.write("## Report vs Field Cross Tab (Canonical + Legacy Usage)")
+    st.write("## Report vs Field Cross Tab (Canonical + Legacy Presence)")
 
     if not field_df.empty and enable_homog and canonical_map:
         tmp = field_df.copy()
@@ -428,7 +430,7 @@ if analyze:
             parts = [p.strip() for p in str(v_str).split(",") if p.strip()]
             canonical_to_variants.setdefault(canon, set()).update(parts)
 
-        # canonical -> legacy (exclude canonical itself)
+        # canonical -> legacy list (exclude canonical itself)
         canonical_to_legacy = {}
         for canon, varset in canonical_to_variants.items():
             canon_norm = str(canon).strip().lower()
@@ -438,20 +440,21 @@ if analyze:
         def overall_legacy_for_display(display_field: str) -> str:
             return canonical_to_legacy.get(display_field, "")
 
-        # per (report_name, display_field)
+        # per (report_name, display_field): compute booleans only
         def agg_group(g: pd.DataFrame) -> pd.Series:
             gsize = int(g["group_size"].iloc[0])
             if gsize <= 1:
-                return pd.Series({"canonical_present": True, "legacy_used": ""})
+                # singleton: treat it as canonical; no legacy
+                return pd.Series({"canonical_present": True, "legacy_present": False})
 
             canon = str(g["canonical"].iloc[0]).strip()
             canon_norm = canon.lower()
 
             originals = [str(x).strip() for x in g["column_original"].tolist()]
-            canon_present = any(x.lower() == canon_norm for x in originals)
+            canonical_present = any(x.lower() == canon_norm for x in originals)
+            legacy_present = any(x.lower() != canon_norm for x in originals)
 
-            legacy_hits = sorted({x for x in originals if x.lower() != canon_norm})
-            return pd.Series({"canonical_present": bool(canon_present), "legacy_used": ", ".join(legacy_hits)})
+            return pd.Series({"canonical_present": bool(canonical_present), "legacy_present": bool(legacy_present)})
 
         agg = (
             tmp.groupby(["report_name", "display_field"], as_index=False)
@@ -465,17 +468,17 @@ if analyze:
         cross_tab = pd.DataFrame(index=fields)
         cross_tab.index.name = "column_original"
 
+        # overall legacy columns
         cross_tab.insert(
             loc=0,
             column="legacy_columns",
             value=pd.Series(fields, index=fields).map(overall_legacy_for_display).fillna("")
         )
 
-        # ✅ FIXED: fill both report columns correctly
+        # two columns per report, BOTH are "x"/""
         for r in reports:
             sub = agg[agg["report_name"] == r].set_index("display_field")
 
-            # canonical present
             cross_tab[r] = (
                 sub["canonical_present"]
                 .reindex(fields)
@@ -483,21 +486,21 @@ if analyze:
                 .map(lambda b: "x" if bool(b) else "")
             )
 
-            # legacy used in that report
-            cross_tab[f"{r} (Legacy Used)"] = (
-                sub["legacy_used"]
+            cross_tab[f"{r} (Legacy)"] = (
+                sub["legacy_present"]
                 .reindex(fields)
-                .fillna("")
+                .fillna(False)
+                .map(lambda b: "x" if bool(b) else "")
             )
 
-        # repetition count: reports where canonical present OR legacy used
+        # repetition count: reports where canonical OR legacy is present
         rep_counts = []
         for f in fields:
             cnt = 0
             for r in reports:
                 canon_x = (cross_tab.at[f, r] == "x")
-                legacy_used = (str(cross_tab.at[f, f"{r} (Legacy Used)"]).strip() != "")
-                if canon_x or legacy_used:
+                legacy_x = (cross_tab.at[f, f"{r} (Legacy)"] == "x")
+                if canon_x or legacy_x:
                     cnt += 1
             rep_counts.append(cnt)
         cross_tab["Repetition Count"] = rep_counts
@@ -506,7 +509,7 @@ if analyze:
         totals = {"legacy_columns": ""}
         for r in reports:
             totals[r] = int((cross_tab[r] == "x").sum())
-            totals[f"{r} (Legacy Used)"] = int((cross_tab[f"{r} (Legacy Used)"].astype(str).str.strip() != "").sum())
+            totals[f"{r} (Legacy)"] = int((cross_tab[f"{r} (Legacy)"] == "x").sum())
         totals["Repetition Count"] = int(cross_tab["Repetition Count"].sum())
         cross_tab.loc["Totals"] = totals
 
@@ -514,6 +517,7 @@ if analyze:
 
     else:
         # fallback: raw crosstab
+        st.write("## Report vs Field Cross Tab (Raw)")
         cross_counts = pd.crosstab(field_df["column_original"], field_df["report_name"])
         cross_tab = cross_counts.applymap(lambda v: "x" if v > 0 else "")
 
